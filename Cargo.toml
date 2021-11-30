@@ -1,0 +1,19 @@
+[package]
+name = "redis-stream-reactor"
+version = "0.0.1-beta.3"
+edition = "2021"
+description = "Redis consumer group reactor"
+readme = "./README.md"
+license = "MIT"
+repository = "https://github.com/Bajix/redis-stream-reactor/"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.51"
+backoff = { version = "0.3.0", features = ["tokio"] }
+futures = "0.3.18"
+rand = "0.8.4"
+redis = { version = "0.21.4", features = ["aio", "tokio-comp"] }
+redis-swapplex = "0.1.0"
+tokio = { version = "1.14.0", features = ["macros", "signal"] }
