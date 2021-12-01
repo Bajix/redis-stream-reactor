@@ -35,17 +35,6 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
   const XACK: bool = true;
   type Error: Send + Debug;
 
-  fn generate_name() -> String {
-    thread_rng()
-      .sample_iter(&Alphanumeric)
-      .take(30)
-      .map(char::from)
-      .collect()
-  }
-
-  // Uniquely generated consumer name
-  fn consumer_name(&self) -> &str;
-
   async fn process_event_stream(&self, keys: Vec<StreamKey>) -> Result<(), RedisError> {
     stream::iter(keys.into_iter().flat_map(|key| {
       let StreamKey { ids, .. } = key;
@@ -111,6 +100,7 @@ where
   G: ConsumerGroup,
 {
   consumer: Arc<T>,
+  consumer_id: String,
   _marker: PhantomData<fn() -> (E, G)>,
 }
 
@@ -125,6 +115,7 @@ where
 
     EventReactor {
       consumer,
+      consumer_id: Self::generate_id(),
       _marker: PhantomData,
     }
   }
@@ -139,6 +130,7 @@ where
   fn clone(&self) -> Self {
     Self {
       consumer: self.consumer.clone(),
+      consumer_id: self.consumer_id.clone(),
       _marker: PhantomData,
     }
   }
@@ -150,6 +142,14 @@ where
   E: StreamEvent,
   G: ConsumerGroup,
 {
+  fn generate_id() -> String {
+    thread_rng()
+      .sample_iter(&Alphanumeric)
+      .take(30)
+      .map(char::from)
+      .collect()
+  }
+
   async fn initialize_consumer_group(&self) -> Result<(), RedisError> {
     let mut conn = get_connection();
 
@@ -182,7 +182,7 @@ where
         .xclaim_options(
           T::STREAM_KEY,
           G::GROUP_NAME,
-          self.consumer.consumer_name(),
+          &self.consumer_id,
           T::CLAIM_IDLE_TIME,
           &["0"],
           StreamClaimOptions::default(),
@@ -215,7 +215,7 @@ where
           &[T::STREAM_KEY],
           &[">"],
           &StreamReadOptions::default()
-            .group(G::GROUP_NAME, self.consumer.consumer_name())
+            .group(G::GROUP_NAME, &self.consumer_id)
             .block(T::READ_BLOCK_TIME)
             .count(T::BATCH_SIZE),
         )
