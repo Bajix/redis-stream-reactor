@@ -9,12 +9,9 @@ use redis_swapplex::get_connection;
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::{signal, try_join};
 
-#[async_trait::async_trait]
 pub trait StreamEvent: Send + Sync + Sized + 'static {
-  type Error: Send + Debug;
-  async fn process_event(&self) -> Result<(), Self::Error>;
   fn from_hashmap(data: &HashMap<String, Value>) -> Option<Self>;
-  fn as_redis_args<'a>(&'a self) -> Vec<(&'a str, Vec<u8>)>;
+  fn as_redis_args(&self) -> Vec<(&str, Vec<u8>)>;
 }
 
 pub trait ConsumerGroup: 'static {
@@ -35,6 +32,8 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
   const XACK: bool = true;
   type Error: Send + Debug;
 
+  async fn process_event(&self, event: &T) -> Result<(), Self::Error>;
+
   async fn process_event_stream(&self, keys: Vec<StreamKey>) -> Result<(), RedisError> {
     stream::iter(keys.into_iter().flat_map(|key| {
       let StreamKey { ids, .. } = key;
@@ -42,16 +41,16 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
     }))
     .map(Ok)
     .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-      self.process_entry(entry).await
+      self.process_stream_entry(entry).await
     })
     .await?;
 
     Ok(())
   }
 
-  async fn process_entry(&self, entry: StreamId) -> Result<(), RedisError> {
+  async fn process_stream_entry(&self, entry: StreamId) -> Result<(), RedisError> {
     if let Some(event) = <T as StreamEvent>::from_hashmap(&entry.map) {
-      match event.process_event().await {
+      match self.process_event(&event).await {
         Ok(()) => {
           let mut conn = get_connection();
 
