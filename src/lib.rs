@@ -1,11 +1,14 @@
 use backoff::ExponentialBackoff;
+use env_url::ServiceURL;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
-  streams::{StreamClaimOptions, StreamId, StreamKey, StreamReadOptions, StreamReadReply},
-  AsyncCommands, RedisError, Value,
+  streams::{
+    StreamClaimOptions, StreamClaimReply, StreamId, StreamKey, StreamReadOptions, StreamReadReply,
+  },
+  AsyncCommands, ErrorKind, RedisError, Value,
 };
-use redis_swapplex::get_connection;
+use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::{signal, try_join};
 
@@ -34,16 +37,13 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
 
   async fn process_event(&self, event: &T) -> Result<(), Self::Error>;
 
-  async fn process_event_stream(&self, keys: Vec<StreamKey>) -> Result<(), RedisError> {
-    stream::iter(keys.into_iter().flat_map(|key| {
-      let StreamKey { ids, .. } = key;
-      ids.into_iter()
-    }))
-    .map(Ok)
-    .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-      self.process_stream_entry(entry).await
-    })
-    .await?;
+  async fn process_event_stream(&self, ids: Vec<StreamId>) -> Result<(), RedisError> {
+    stream::iter(ids.into_iter())
+      .map(Ok)
+      .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
+        self.process_stream_entry(entry).await
+      })
+      .await?;
 
     Ok(())
   }
@@ -55,14 +55,16 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
           let mut conn = get_connection();
 
           if Self::XACK {
-            let _ = conn
+            let _: i64 = conn
               .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
               .await?;
           } else {
-            let _ = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
+            let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
           }
         }
         Err(err) => {
+          log::error!("Error processing stream event: {:?}", err);
+
           let mut conn = get_connection();
 
           let mut pipe = redis::pipe();
@@ -70,20 +72,22 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
           let event = event.as_redis_args();
 
           if let Some(key) = Self::ERROR_STREAM_KEY {
-            pipe.xadd(key, &entry.id, &event[..]);
+            pipe.xadd(key, &entry.id, &event[..]).ignore();
           }
 
           if let Some(key) = Self::ERROR_HASH_KEY {
-            pipe.hset(key, &entry.id, format!("{:?}", &err));
+            pipe.hset(key, &entry.id, format!("{:?}", &err)).ignore();
           }
 
           if Self::XACK {
-            pipe.xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id]);
+            pipe
+              .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
+              .ignore();
           } else {
-            pipe.xdel(Self::STREAM_KEY, &[&entry.id]);
+            pipe.xdel(Self::STREAM_KEY, &[&entry.id]).ignore();
           }
 
-          let _ = pipe.query_async(&mut conn).await?;
+          let _: () = pipe.query_async(&mut conn).await?;
         }
       }
     }
@@ -150,34 +154,42 @@ where
   }
 
   async fn initialize_consumer_group(&self) -> Result<(), RedisError> {
-    let mut conn = get_connection();
-
-    let mut pipe = redis::pipe();
-
-    // Initialize consumer groups & redis streams
-    pipe.xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0");
+    let url = RedisEnvService::service_url().map_err(|_| {
+      RedisError::from((
+        ErrorKind::InvalidClientConfig,
+        "Invalid Redis connection URL",
+      ))
+    })?;
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_async_connection().await?;
 
     if let Some(error_stream) = T::ERROR_STREAM_KEY {
-      pipe.xgroup_create_mkstream(error_stream, G::GROUP_NAME, "0");
-    }
+      let mut pipe = redis::pipe();
+      pipe
+        .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
+        .ignore();
+      pipe
+        .xgroup_create_mkstream(error_stream, G::GROUP_NAME, "0")
+        .ignore();
 
-    let result: Result<(String, String), RedisError> = pipe.query_async(&mut conn).await;
+      let _: () = pipe.query_async(&mut conn).await?;
 
-    match result {
-      // It is expected behavior that this will fail when already initalized
-      // Expected error: `BUSYGROUP: Consumer Group name already exists`
-      Err(err) if err.code() == Some("BUSYGROUP") => Ok(()),
-      Err(err) => Err(err),
-      Ok(_) => Ok(()),
+      Ok(())
+    } else {
+      let _: String = conn
+        .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
+        .await?;
+
+      Ok(())
     }
   }
 
-  async fn claim_idle_batch(&self) -> Result<Option<StreamReadReply>, RedisError> {
+  async fn claim_idle_batch(&self) -> Result<Option<StreamClaimReply>, RedisError> {
     tokio::select! {
       reply = async {
         let mut conn = get_connection();
 
-      let reply: StreamReadReply = conn
+      let reply: StreamClaimReply = conn
         .xclaim_options(
           T::STREAM_KEY,
           G::GROUP_NAME,
@@ -196,8 +208,8 @@ where
 
   async fn process_idle_pending(&self) -> Result<(), RedisError> {
     while let Some(reply) = self.claim_idle_batch().await? {
-      if !reply.keys.is_empty() {
-        self.consumer.process_event_stream(reply.keys).await?;
+      if !reply.ids.is_empty() {
+        self.consumer.process_event_stream(reply.ids).await?;
       }
     }
 
@@ -229,7 +241,16 @@ where
   async fn process_stream(&self) -> Result<(), RedisError> {
     while let Some(reply) = self.next_batch().await? {
       if !reply.keys.is_empty() {
-        self.consumer.process_event_stream(reply.keys).await?;
+        let ids: Vec<StreamId> = reply
+          .keys
+          .into_iter()
+          .flat_map(|key| {
+            let StreamKey { ids, .. } = key;
+            ids.into_iter()
+          })
+          .collect();
+
+        self.consumer.process_event_stream(ids).await?;
       }
     }
 
@@ -237,9 +258,15 @@ where
   }
 
   pub async fn start_reactor(self) -> Result<(), RedisError> {
-    self.initialize_consumer_group().await?;
+    match self.initialize_consumer_group().await {
+      // It is expected behavior that this will fail when already initalized
+      // Expected error: `BUSYGROUP: Consumer Group name already exists`
+      Err(err) if err.code() == Some("BUSYGROUP") => Ok(()),
+      Err(err) => Err(err),
+      Ok(_) => Ok(()),
+    }?;
 
-    let _: Result<_, RedisError> = try_join!(
+    try_join!(
       backoff::future::retry(ExponentialBackoff::default(), || async {
         self.process_idle_pending().await?;
 
@@ -250,7 +277,7 @@ where
 
         Ok(())
       })
-    );
+    )?;
 
     Ok(())
   }
