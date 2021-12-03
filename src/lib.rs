@@ -6,15 +6,17 @@ use redis::{
   streams::{
     StreamClaimOptions, StreamClaimReply, StreamId, StreamKey, StreamReadOptions, StreamReadReply,
   },
-  AsyncCommands, ErrorKind, RedisError, Value,
+  AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::{signal, try_join};
 
 pub trait StreamEvent: Send + Sync + Sized + 'static {
+  type Key: ToRedisArgs + Send;
+  type Value: ToRedisArgs + Send;
   fn from_hashmap(data: &HashMap<String, Value>) -> Option<Self>;
-  fn as_redis_args(&self) -> Vec<(&str, Vec<u8>)>;
+  fn as_redis_args(&self) -> Vec<(Self::Key, Self::Value)>;
 }
 
 pub trait ConsumerGroup: 'static {
