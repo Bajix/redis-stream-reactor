@@ -3,9 +3,7 @@ use env_url::ServiceURL;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
-  streams::{
-    StreamClaimOptions, StreamClaimReply, StreamId, StreamKey, StreamReadOptions, StreamReadReply,
-  },
+  streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
   AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
@@ -186,21 +184,25 @@ where
     }
   }
 
-  async fn claim_idle_batch(&self) -> Result<Option<StreamClaimReply>, RedisError> {
+  async fn autoclaim_batch(
+    &self,
+    cursor: &str,
+  ) -> Result<Option<(String, StreamRangeReply)>, RedisError> {
     tokio::select! {
       reply = async {
         let mut conn = get_connection();
 
-      let reply: StreamClaimReply = conn
-        .xclaim_options(
-          T::STREAM_KEY,
-          G::GROUP_NAME,
-          &self.consumer_id,
-          T::CLAIM_IDLE_TIME,
-          &["0"],
-          StreamClaimOptions::default(),
-        )
-        .await?;
+        let mut cmd = redis::cmd("XAUTOCLAIM");
+
+        cmd.arg(T::STREAM_KEY)
+          .arg(G::GROUP_NAME)
+          .arg(&self.consumer_id)
+          .arg(T::CLAIM_IDLE_TIME)
+          .arg(cursor)
+          .arg("COUNT")
+          .arg(T::BATCH_SIZE);
+
+        let reply: (String, StreamRangeReply) = cmd.query_async(&mut conn).await?;
 
         Ok(Some(reply))
       } => reply,
@@ -209,7 +211,11 @@ where
   }
 
   async fn process_idle_pending(&self) -> Result<(), RedisError> {
-    while let Some(reply) = self.claim_idle_batch().await? {
+    let mut cursor = String::from("0-0");
+
+    while let Some((next_cursor, reply)) = self.autoclaim_batch(cursor.as_str()).await? {
+      cursor = next_cursor;
+
       if !reply.ids.is_empty() {
         self.consumer.process_event_stream(reply.ids).await?;
       }
