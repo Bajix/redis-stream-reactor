@@ -7,7 +7,7 @@ use redis::{
   AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
-use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{signal, try_join};
 
 pub trait StreamEvent: Send + Sync + Sized + 'static {
@@ -28,8 +28,8 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
   const STREAM_KEY: &'static str;
   const ERROR_STREAM_KEY: Option<&'static str>;
   const ERROR_HASH_KEY: Option<&'static str>;
-  const CLAIM_IDLE_TIME: usize = 2000;
-  const READ_BLOCK_TIME: usize = 2000;
+  const MIN_IDLE_TIME: Duration = Duration::from_secs(2);
+  const XREAD_BLOCK_TIME: Duration = Duration::from_secs(2);
   const BATCH_SIZE: usize = 100;
   const CONCURRENCY: usize = 10;
   const XACK: bool = true;
@@ -197,7 +197,7 @@ where
         cmd.arg(T::STREAM_KEY)
           .arg(G::GROUP_NAME)
           .arg(&self.consumer_id)
-          .arg(T::CLAIM_IDLE_TIME)
+          .arg(T::MIN_IDLE_TIME.as_millis() as usize)
           .arg(cursor)
           .arg("COUNT")
           .arg(T::BATCH_SIZE);
@@ -235,7 +235,7 @@ where
           &[">"],
           &StreamReadOptions::default()
             .group(G::GROUP_NAME, &self.consumer_id)
-            .block(T::READ_BLOCK_TIME)
+            .block(T::XREAD_BLOCK_TIME.as_millis() as usize)
             .count(T::BATCH_SIZE),
         )
         .await?;
