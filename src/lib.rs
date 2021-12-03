@@ -4,17 +4,15 @@ use futures::{stream, StreamExt, TryStreamExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
   streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
-  AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
+  AsyncCommands, ErrorKind, RedisError, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{signal, time::sleep, try_join};
 
 pub trait StreamEvent: Send + Sync + Sized + 'static {
-  type Key: ToRedisArgs + Send;
-  type Value: ToRedisArgs + Send;
   fn from_hashmap(data: &HashMap<String, Value>) -> Option<Self>;
-  fn as_redis_args(&self) -> Vec<(Self::Key, Self::Value)>;
+  fn as_redis_args<'a>(&'a self) -> Vec<(&'a str, &'a str)>;
 }
 
 pub trait ConsumerGroup: 'static {
