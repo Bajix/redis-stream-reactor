@@ -8,7 +8,7 @@ use redis::{
 };
 use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
-use tokio::{signal, try_join};
+use tokio::{signal, time::sleep, try_join};
 
 pub trait StreamEvent: Send + Sync + Sized + 'static {
   type Key: ToRedisArgs + Send;
@@ -218,6 +218,8 @@ where
 
       if !reply.ids.is_empty() {
         self.consumer.process_event_stream(reply.ids).await?;
+      } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
+        sleep(sleep_time).await;
       }
     }
 
