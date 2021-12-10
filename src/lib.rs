@@ -10,6 +10,11 @@ use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{signal, time::sleep, try_join};
 
+pub enum DeliveryStatus {
+  NewDelivery,
+  MinIdleElapsed,
+}
+
 pub trait StreamEvent: Send + Sync + Sized + 'static {
   fn from_hashmap(data: &HashMap<String, Value>) -> Option<Self>;
   fn as_redis_args<'a>(&'a self) -> Vec<(&'a str, &'a str)>;
@@ -33,22 +38,30 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
   const XACK: bool = true;
   type Error: Send + Debug;
 
-  async fn process_event(&self, event: &T) -> Result<(), Self::Error>;
+  async fn process_event(&self, event: &T, status: &DeliveryStatus) -> Result<(), Self::Error>;
 
-  async fn process_event_stream(&self, ids: Vec<StreamId>) -> Result<(), RedisError> {
+  async fn process_event_stream(
+    &self,
+    ids: Vec<StreamId>,
+    status: &DeliveryStatus,
+  ) -> Result<(), RedisError> {
     stream::iter(ids.into_iter())
       .map(Ok)
       .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-        self.process_stream_entry(entry).await
+        self.process_stream_entry(entry, &status).await
       })
       .await?;
 
     Ok(())
   }
 
-  async fn process_stream_entry(&self, entry: StreamId) -> Result<(), RedisError> {
+  async fn process_stream_entry(
+    &self,
+    entry: StreamId,
+    status: &DeliveryStatus,
+  ) -> Result<(), RedisError> {
     if let Some(event) = <T as StreamEvent>::from_hashmap(&entry.map) {
-      match self.process_event(&event).await {
+      match self.process_event(&event, &status).await {
         Ok(()) => {
           let mut conn = get_connection();
 
@@ -215,7 +228,10 @@ where
       cursor = next_cursor;
 
       if !reply.ids.is_empty() {
-        self.consumer.process_event_stream(reply.ids).await?;
+        self
+          .consumer
+          .process_event_stream(reply.ids, &DeliveryStatus::MinIdleElapsed)
+          .await?;
       } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
         sleep(sleep_time).await;
       }
@@ -258,7 +274,10 @@ where
           })
           .collect();
 
-        self.consumer.process_event_stream(ids).await?;
+        self
+          .consumer
+          .process_event_stream(ids, &DeliveryStatus::NewDelivery)
+          .await?;
       }
     }
 
