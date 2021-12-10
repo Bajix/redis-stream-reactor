@@ -8,11 +8,26 @@ use redis::{
 };
 use redis_swapplex::{get_connection, RedisEnvService};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
+use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
 
 pub enum DeliveryStatus {
+  /// Stream entry newly delivered to consumer group
   NewDelivery,
+  /// Stream entry was claimed via XAUTOCLAIM
   MinIdleElapsed,
+}
+
+#[derive(Debug, Error)]
+pub enum TaskError<T: Send + Debug> {
+  /// Bypass error handling and delete stream entry via XDEL
+  #[error("Stream entry marked for deletion")]
+  XDEL,
+  /// Skip stream entry acknowledgement
+  #[error("Stream entry acknowledgment skipped")]
+  SkipAcknowledgement,
+  #[error(transparent)]
+  Error(#[from] T),
 }
 
 pub trait StreamEvent: Send + Sync + Sized + 'static {
@@ -38,7 +53,11 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
   const XACK: bool = true;
   type Error: Send + Debug;
 
-  async fn process_event(&self, event: &T, status: &DeliveryStatus) -> Result<(), Self::Error>;
+  async fn process_event(
+    &self,
+    event: &T,
+    status: &DeliveryStatus,
+  ) -> Result<(), TaskError<Self::Error>>;
 
   async fn process_event_stream(
     &self,
@@ -73,33 +92,43 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
             let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
           }
         }
-        Err(err) => {
-          log::error!("Error processing stream event: {:?}", err);
-
-          let mut conn = get_connection();
-
-          let mut pipe = redis::pipe();
-
-          let event = event.as_redis_args();
-
-          if let Some(key) = Self::ERROR_STREAM_KEY {
-            pipe.xadd(key, &entry.id, &event[..]).ignore();
+        Err(err) => match err {
+          TaskError::XDEL => {
+            let mut conn = get_connection();
+            let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
           }
+          TaskError::SkipAcknowledgement => (),
+          TaskError::Error(err) => {
+            log::error!("Error processing stream event: {:?}", err);
 
-          if let Some(key) = Self::ERROR_HASH_KEY {
-            pipe.hset(key, &entry.id, format!("{:?}", &err)).ignore();
+            match (Self::ERROR_STREAM_KEY, Self::ERROR_HASH_KEY) {
+              (Some(stream_key), Some(hash_key)) => {
+                let mut conn = get_connection();
+
+                let mut pipe = redis::pipe();
+
+                let event = event.as_redis_args();
+
+                pipe.xadd(stream_key, &entry.id, &event[..]).ignore();
+                pipe
+                  .hset(hash_key, &entry.id, format!("{:?}", &err))
+                  .ignore();
+
+                let _: () = pipe.query_async(&mut conn).await?;
+              }
+              (Some(key), None) => {
+                let mut conn = get_connection();
+                let event = event.as_redis_args();
+                let _: String = conn.xadd(key, &entry.id, &event[..]).await?;
+              }
+              (None, Some(key)) => {
+                let mut conn = get_connection();
+                let _: i64 = conn.hset(key, &entry.id, format!("{:?}", &err)).await?;
+              }
+              _ => (),
+            };
           }
-
-          if Self::XACK {
-            pipe
-              .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
-              .ignore();
-          } else {
-            pipe.xdel(Self::STREAM_KEY, &[&entry.id]).ignore();
-          }
-
-          let _: () = pipe.query_async(&mut conn).await?;
-        }
+        },
       }
     }
 

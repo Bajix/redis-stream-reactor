@@ -1,6 +1,6 @@
 [package]
 name = "redis-stream-reactor"
-version = "0.0.1-beta.18"
+version = "0.0.1-beta.20"
 edition = "2021"
 description = "Redis consumer group reactor"
 readme = "./README.md"
@@ -18,4 +18,5 @@ log = "0.4.14"
 rand = "0.8.4"
 redis = { version = "0.21.4", features = ["aio", "tokio-comp"] }
 redis-swapplex = "0.1.1"
+thiserror = "1.0.30"
 tokio = { version = "1", features = ["macros", "signal"] }
