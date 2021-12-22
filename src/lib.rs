@@ -1,12 +1,14 @@
 use backoff::ExponentialBackoff;
 use env_url::ServiceURL;
 use futures::{stream, StreamExt, TryStreamExt};
+use itertools::Itertools;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
   streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
-  AsyncCommands, ErrorKind, RedisError, Value,
+  AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
+use serde::de::DeserializeOwned;
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
@@ -30,9 +32,54 @@ pub enum TaskError<T: Send + Debug> {
   Error(#[from] T),
 }
 
-pub trait StreamEvent: Send + Sync + Sized + 'static {
-  fn from_hashmap(data: &HashMap<String, Value>) -> Option<Self>;
-  fn as_redis_args<'a>(&'a self) -> Vec<(&'a str, &'a str)>;
+/// To use generic impl derive [`redis::toRedisArgs`](https://docs.rs/redis/0.21/redis/trait.ToRedisArgs.html) with [`redis_serde_json::RedisJsonValue`](https://docs.rs/redis_serde_json/0.1.0/redis_serde_json/derive.RedisJsonValue.html)
+pub trait StreamEntry: Send + Sync + DeserializeOwned {
+  fn from_hashmap(data: &HashMap<String, Value>) -> Result<Self, RedisError>;
+  fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
+}
+
+impl<T> StreamEntry for T
+where
+  T: Send + Sync + DeserializeOwned + ToRedisArgs,
+{
+  fn from_hashmap(entry: &HashMap<String, Value>) -> Result<Self, RedisError> {
+    let data = entry
+      .iter()
+      .map(|(key, value)| match *value {
+        redis::Value::Data(ref bytes) => std::str::from_utf8(&bytes[..])
+          .map_err(|err| {
+            RedisError::from((
+              redis::ErrorKind::TypeError,
+              "Stream field value invalid utf8",
+              err.to_string(),
+            ))
+          })
+          .map(|value| (key.to_owned(), serde_json::Value::String(value.to_owned()))),
+        _ => Err(RedisError::from((
+          redis::ErrorKind::TypeError,
+          "invalid response type for JSON",
+        ))),
+      })
+      .collect::<Result<Vec<(String, serde_json::Value)>, RedisError>>()?;
+
+    let data = serde_json::map::Map::from_iter(data.into_iter());
+
+    serde_json::from_value(serde_json::Value::Object(data)).map_err(|err| {
+      RedisError::from((
+        ErrorKind::TypeError,
+        "JSON deserialization failed",
+        err.to_string(),
+      ))
+    })
+  }
+
+  fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    self
+      .to_redis_args()
+      .into_iter()
+      .tuple_windows::<(_, _)>()
+      .collect_vec()
+  }
 }
 
 pub trait ConsumerGroup: 'static {
@@ -40,7 +87,7 @@ pub trait ConsumerGroup: 'static {
 }
 
 #[async_trait::async_trait]
-pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
+pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>:
   Default + Send + Sync + 'static
 {
   const STREAM_KEY: &'static str;
@@ -67,7 +114,7 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
     stream::iter(ids.into_iter())
       .map(Ok)
       .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-        self.process_stream_entry(entry, &status).await
+        self.process_stream_entry(entry, status).await
       })
       .await?;
 
@@ -79,57 +126,57 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
     entry: StreamId,
     status: &DeliveryStatus,
   ) -> Result<(), RedisError> {
-    if let Some(event) = <T as StreamEvent>::from_hashmap(&entry.map) {
-      match self.process_event(&event, &status).await {
-        Ok(()) => {
-          let mut conn = get_connection();
+    let event = <T as StreamEntry>::from_hashmap(&entry.map)?;
 
-          if Self::XACK {
-            let _: i64 = conn
-              .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
-              .await?;
-          } else {
-            let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
-          }
+    match self.process_event(&event, status).await {
+      Ok(()) => {
+        let mut conn = get_connection();
+
+        if Self::XACK {
+          let _: i64 = conn
+            .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
+            .await?;
+        } else {
+          let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
         }
-        Err(err) => match err {
-          TaskError::XDEL => {
-            let mut conn = get_connection();
-            let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
-          }
-          TaskError::SkipAcknowledgement => (),
-          TaskError::Error(err) => {
-            log::error!("Error processing stream event: {:?}", err);
-
-            match (Self::ERROR_STREAM_KEY, Self::ERROR_HASH_KEY) {
-              (Some(stream_key), Some(hash_key)) => {
-                let mut conn = get_connection();
-
-                let mut pipe = redis::pipe();
-
-                let event = event.as_redis_args();
-
-                pipe.xadd(stream_key, &entry.id, &event[..]).ignore();
-                pipe
-                  .hset(hash_key, &entry.id, format!("{:?}", &err))
-                  .ignore();
-
-                let _: () = pipe.query_async(&mut conn).await?;
-              }
-              (Some(key), None) => {
-                let mut conn = get_connection();
-                let event = event.as_redis_args();
-                let _: String = conn.xadd(key, &entry.id, &event[..]).await?;
-              }
-              (None, Some(key)) => {
-                let mut conn = get_connection();
-                let _: i64 = conn.hset(key, &entry.id, format!("{:?}", &err)).await?;
-              }
-              _ => (),
-            };
-          }
-        },
       }
+      Err(err) => match err {
+        TaskError::XDEL => {
+          let mut conn = get_connection();
+          let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
+        }
+        TaskError::SkipAcknowledgement => (),
+        TaskError::Error(err) => {
+          log::error!("Error processing stream event: {:?}", err);
+
+          match (Self::ERROR_STREAM_KEY, Self::ERROR_HASH_KEY) {
+            (Some(stream_key), Some(hash_key)) => {
+              let mut conn = get_connection();
+
+              let mut pipe = redis::pipe();
+
+              let event = event.as_redis_args();
+
+              pipe.xadd(stream_key, &entry.id, &event[..]).ignore();
+              pipe
+                .hset(hash_key, &entry.id, format!("{:?}", &err))
+                .ignore();
+
+              let _: () = pipe.query_async(&mut conn).await?;
+            }
+            (Some(key), None) => {
+              let mut conn = get_connection();
+              let event = event.as_redis_args();
+              let _: String = conn.xadd(key, &entry.id, &event[..]).await?;
+            }
+            (None, Some(key)) => {
+              let mut conn = get_connection();
+              let _: i64 = conn.hset(key, &entry.id, format!("{:?}", &err)).await?;
+            }
+            _ => (),
+          };
+        }
+      },
     }
 
     Ok(())
@@ -139,7 +186,7 @@ pub trait StreamConsumer<T: StreamEvent, G: ConsumerGroup>:
 pub struct EventReactor<T, E, G>
 where
   T: StreamConsumer<E, G>,
-  E: StreamEvent,
+  E: StreamEntry,
   G: ConsumerGroup,
 {
   consumer: Arc<T>,
@@ -150,7 +197,7 @@ where
 impl<T, E, G> Default for EventReactor<T, E, G>
 where
   T: StreamConsumer<E, G>,
-  E: StreamEvent,
+  E: StreamEntry,
   G: ConsumerGroup,
 {
   fn default() -> Self {
@@ -167,7 +214,7 @@ where
 impl<T, E, G> Clone for EventReactor<T, E, G>
 where
   T: StreamConsumer<E, G>,
-  E: StreamEvent,
+  E: StreamEntry,
   G: ConsumerGroup,
 {
   fn clone(&self) -> Self {
@@ -182,7 +229,7 @@ where
 impl<T, E, G> EventReactor<T, E, G>
 where
   T: StreamConsumer<E, G>,
-  E: StreamEvent,
+  E: StreamEntry,
   G: ConsumerGroup,
 {
   fn generate_id() -> String {
@@ -194,10 +241,11 @@ where
   }
 
   async fn initialize_consumer_group(&self) -> Result<(), RedisError> {
-    let url = RedisEnvService::service_url().map_err(|_| {
+    let url = RedisEnvService::service_url().map_err(|err| {
       RedisError::from((
         ErrorKind::InvalidClientConfig,
         "Invalid Redis connection URL",
+        err.to_string(),
       ))
     })?;
     let client = redis::Client::open(url)?;
