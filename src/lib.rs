@@ -24,7 +24,7 @@ pub enum DeliveryStatus {
 pub enum TaskError<T: Send + Debug> {
   /// Bypass error handling and delete stream entry via XDEL
   #[error("Stream entry marked for deletion")]
-  XDEL,
+  Delete,
   /// Skip stream entry acknowledgement
   #[error("Stream entry acknowledgment skipped")]
   SkipAcknowledgement,
@@ -141,7 +141,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>:
         }
       }
       Err(err) => match err {
-        TaskError::XDEL => {
+        TaskError::Delete => {
           let mut conn = get_connection();
           let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
         }
