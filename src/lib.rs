@@ -8,7 +8,7 @@ use redis::{
   AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
-use serde::de::DeserializeOwned;
+use serde::de::Deserialize;
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
@@ -32,15 +32,15 @@ pub enum TaskError<T: Send + Debug> {
   Error(#[from] T),
 }
 
-/// To use generic impl derive [`redis::toRedisArgs`](https://docs.rs/redis/0.21/redis/trait.ToRedisArgs.html) with [`redis_serde_json::RedisJsonValue`](https://docs.rs/redis_serde_json/0.1.0/redis_serde_json/derive.RedisJsonValue.html)
-pub trait StreamEntry: Send + Sync + DeserializeOwned {
+/// To use generic impl derive [`redis::toRedisArgs`](https://docs.rs/redis/0.21/redis/trait.ToRedisArgs.html) with [`derive_redis_json::RedisJsonValue`](https://docs.rs/derive-redis-json/0.1.1/derive_redis_json/derive.RedisJsonValue.html)
+pub trait StreamEntry: Send + Sync + Sized {
   fn from_hashmap(data: &HashMap<String, Value>) -> Result<Self, RedisError>;
   fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
 }
 
 impl<T> StreamEntry for T
 where
-  T: Send + Sync + DeserializeOwned + ToRedisArgs,
+  T: Send + Sync + Sized + for<'de> Deserialize<'de> + ToRedisArgs,
 {
   fn from_hashmap(entry: &HashMap<String, Value>) -> Result<Self, RedisError> {
     let data = entry
@@ -74,22 +74,18 @@ where
   }
 
   fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-    self
-      .to_redis_args()
+    self.to_redis_args()
       .into_iter()
       .tuple_windows::<(_, _)>()
       .collect_vec()
   }
 }
-
-pub trait ConsumerGroup: 'static {
+pub trait ConsumerGroup {
   const GROUP_NAME: &'static str;
 }
 
 #[async_trait::async_trait]
-pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>:
-  Default + Send + Sync + 'static
-{
+pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Sync {
   const STREAM_KEY: &'static str;
   const ERROR_STREAM_KEY: Option<&'static str>;
   const ERROR_HASH_KEY: Option<&'static str>;
@@ -155,9 +151,9 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>:
 
               let mut pipe = redis::pipe();
 
-              let event = event.as_redis_args();
+              let args = event.as_redis_args();
 
-              pipe.xadd(stream_key, &entry.id, &event[..]).ignore();
+              pipe.xadd(stream_key, &entry.id, &args[..]).ignore();
               pipe
                 .hset(hash_key, &entry.id, format!("{:?}", &err))
                 .ignore();
@@ -166,8 +162,8 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>:
             }
             (Some(key), None) => {
               let mut conn = get_connection();
-              let event = event.as_redis_args();
-              let _: String = conn.xadd(key, &entry.id, &event[..]).await?;
+              let args = event.as_redis_args();
+              let _: String = conn.xadd(key, &entry.id, &args[..]).await?;
             }
             (None, Some(key)) => {
               let mut conn = get_connection();
