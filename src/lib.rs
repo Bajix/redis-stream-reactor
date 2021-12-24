@@ -9,7 +9,13 @@ use redis::{
 };
 use redis_swapplex::{get_connection, RedisEnvService};
 use serde::de::Deserialize;
-use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+  collections::HashMap,
+  fmt::Debug,
+  marker::PhantomData,
+  sync::Arc,
+  time::{Duration, SystemTime},
+};
 use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
 
@@ -28,6 +34,7 @@ pub enum TaskError<T: Send + Debug> {
   /// Skip stream entry acknowledgement
   #[error("Stream entry acknowledgment skipped")]
   SkipAcknowledgement,
+  /// Pass through of original error
   #[error(transparent)]
   Error(#[from] T),
 }
@@ -74,7 +81,8 @@ where
   }
 
   fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-    self.to_redis_args()
+    self
+      .to_redis_args()
       .into_iter()
       .tuple_windows::<(_, _)>()
       .collect_vec()
@@ -179,12 +187,22 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
   }
 }
 
+#[derive(Clone)]
+/// The current state of the consumer group
+pub enum ConsumerGroupState {
+  Uninitialized,
+  NewlyCreated,
+  PreviouslyCreated,
+}
+
+/// Redis event stream reactor
 pub struct EventReactor<T, E, G>
 where
   T: StreamConsumer<E, G>,
   E: StreamEntry,
   G: ConsumerGroup,
 {
+  group_status: ConsumerGroupState,
   consumer: Arc<T>,
   consumer_id: String,
   _marker: PhantomData<fn() -> (E, G)>,
@@ -200,6 +218,7 @@ where
     let consumer = Arc::new(T::default());
 
     EventReactor {
+      group_status: ConsumerGroupState::Uninitialized,
       consumer,
       consumer_id: Self::generate_id(),
       _marker: PhantomData,
@@ -215,6 +234,7 @@ where
 {
   fn clone(&self) -> Self {
     Self {
+      group_status: self.group_status.clone(),
       consumer: self.consumer.clone(),
       consumer_id: self.consumer_id.clone(),
       _marker: PhantomData,
@@ -236,7 +256,8 @@ where
       .collect()
   }
 
-  async fn initialize_consumer_group(&self) -> Result<(), RedisError> {
+  /// Manually initialize Redis consumer group; otherwise [`EventReactor::start_reactor`] will initialize
+  pub async fn initialize_consumer_group(&mut self) -> Result<ConsumerGroupState, RedisError> {
     let url = RedisEnvService::service_url().map_err(|err| {
       RedisError::from((
         ErrorKind::InvalidClientConfig,
@@ -247,7 +268,7 @@ where
     let client = redis::Client::open(url)?;
     let mut conn = client.get_async_connection().await?;
 
-    if let Some(error_stream) = T::ERROR_STREAM_KEY {
+    let result: Result<(), RedisError> = if let Some(error_stream) = T::ERROR_STREAM_KEY {
       let mut pipe = redis::pipe();
       pipe
         .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
@@ -256,15 +277,26 @@ where
         .xgroup_create_mkstream(error_stream, G::GROUP_NAME, "0")
         .ignore();
 
-      let _: () = pipe.query_async(&mut conn).await?;
-
-      Ok(())
+      pipe.query_async(&mut conn).await
     } else {
-      let _: String = conn
+      conn
         .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
-        .await?;
+        .await
+        .map(|_: String| ())
+    };
 
-      Ok(())
+    match result {
+      // It is expected behavior that this will fail when already initalized
+      // Expected error: `BUSYGROUP: Consumer Group name already exists`
+      Err(err) if err.code() == Some("BUSYGROUP") => {
+        self.group_status = ConsumerGroupState::PreviouslyCreated;
+        Ok(ConsumerGroupState::PreviouslyCreated)
+      }
+      Err(err) => Err(err),
+      Ok(_) => {
+        self.group_status = ConsumerGroupState::NewlyCreated;
+        Ok(ConsumerGroupState::NewlyCreated)
+      }
     }
   }
 
@@ -294,11 +326,15 @@ where
     }
   }
 
-  async fn process_idle_pending(&self) -> Result<(), RedisError> {
+  async fn process_idle_pending(&self, exit_on_idle: bool) -> Result<(), RedisError> {
     let mut cursor = String::from("0-0");
+
+    let start_time = SystemTime::now();
 
     while let Some((next_cursor, reply)) = self.autoclaim_batch(cursor.as_str()).await? {
       cursor = next_cursor;
+
+      let poll_time = SystemTime::now();
 
       if !reply.ids.is_empty() {
         self
@@ -306,6 +342,14 @@ where
           .process_event_stream(reply.ids, &DeliveryStatus::MinIdleElapsed)
           .await?;
       } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
+        if exit_on_idle {
+          if let Ok(call_elapsed) = poll_time.duration_since(start_time) {
+            if call_elapsed.gt(&T::MIN_IDLE_TIME) {
+              continue;
+            }
+          }
+        }
+
         sleep(sleep_time).await;
       }
     }
@@ -357,18 +401,19 @@ where
     Ok(())
   }
 
-  pub async fn start_reactor(self) -> Result<(), RedisError> {
-    match self.initialize_consumer_group().await {
-      // It is expected behavior that this will fail when already initalized
-      // Expected error: `BUSYGROUP: Consumer Group name already exists`
-      Err(err) if err.code() == Some("BUSYGROUP") => Ok(()),
-      Err(err) => Err(err),
-      Ok(_) => Ok(()),
-    }?;
+  /// Indefinitely process redis stream entries, optionally clearing all the potential idle-pending backlog before claiming new entries
+  pub async fn start_reactor(mut self, clear_backlog: bool) -> Result<(), RedisError> {
+    if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
+      self.initialize_consumer_group().await?;
+    }
+
+    if clear_backlog && matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
+      self.process_idle_pending(true).await?;
+    }
 
     try_join!(
       backoff::future::retry(ExponentialBackoff::default(), || async {
-        self.process_idle_pending().await?;
+        self.process_idle_pending(false).await?;
 
         Ok(())
       }),
