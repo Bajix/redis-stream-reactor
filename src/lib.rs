@@ -10,6 +10,7 @@ use redis::{
 use redis_swapplex::{get_connection, RedisEnvService};
 use serde::de::Deserialize;
 use std::{
+  borrow::Cow,
   collections::HashMap,
   fmt::Debug,
   marker::PhantomData,
@@ -18,7 +19,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
-
+use tokio_util::sync::CancellationToken;
 pub enum DeliveryStatus {
   /// Stream entry newly delivered to consumer group
   NewDelivery,
@@ -94,31 +95,30 @@ pub trait ConsumerGroup {
 
 #[async_trait::async_trait]
 pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Sync {
-  const STREAM_KEY: &'static str;
-  const ERROR_STREAM_KEY: Option<&'static str>;
-  const ERROR_HASH_KEY: Option<&'static str>;
-  const MIN_IDLE_TIME: Duration = Duration::from_secs(2);
-  const XREAD_BLOCK_TIME: Duration = Duration::from_secs(2);
+  const MIN_IDLE_TIME: Duration = Duration::from_millis(1500);
+  const XREAD_BLOCK_TIME: Duration = Duration::from_secs(60);
   const BATCH_SIZE: usize = 100;
   const CONCURRENCY: usize = 10;
-  const XACK: bool = true;
   type Error: Send + Debug;
+  type Data: Send + Sync;
 
   async fn process_event(
     &self,
+    ctx: &Context<Self::Data>,
     event: &T,
     status: &DeliveryStatus,
   ) -> Result<(), TaskError<Self::Error>>;
 
   async fn process_event_stream(
     &self,
+    ctx: &Context<Self::Data>,
     ids: Vec<StreamId>,
     status: &DeliveryStatus,
   ) -> Result<(), RedisError> {
     stream::iter(ids.into_iter())
       .map(Ok)
       .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-        self.process_stream_entry(entry, status).await
+        self.process_stream_entry(ctx, entry, status).await
       })
       .await?;
 
@@ -127,33 +127,30 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
 
   async fn process_stream_entry(
     &self,
+    ctx: &Context<Self::Data>,
     entry: StreamId,
     status: &DeliveryStatus,
   ) -> Result<(), RedisError> {
     let event = <T as StreamEntry>::from_hashmap(&entry.map)?;
 
-    match self.process_event(&event, status).await {
+    match self.process_event(ctx, &event, status).await {
       Ok(()) => {
         let mut conn = get_connection();
 
-        if Self::XACK {
-          let _: i64 = conn
-            .xack(Self::STREAM_KEY, G::GROUP_NAME, &[&entry.id])
-            .await?;
-        } else {
-          let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
-        }
+        let _: i64 = conn
+          .xack(ctx.stream_key(), G::GROUP_NAME, &[&entry.id])
+          .await?;
       }
       Err(err) => match err {
         TaskError::Delete => {
           let mut conn = get_connection();
-          let _: i64 = conn.xdel(Self::STREAM_KEY, &[&entry.id]).await?;
+          let _: i64 = conn.xdel(ctx.stream_key(), &[&entry.id]).await?;
         }
         TaskError::SkipAcknowledgement => (),
         TaskError::Error(err) => {
           log::error!("Error processing stream event: {:?}", err);
 
-          match (Self::ERROR_STREAM_KEY, Self::ERROR_HASH_KEY) {
+          match (ctx.error_stream_key(), ctx.error_hash_key()) {
             (Some(stream_key), Some(hash_key)) => {
               let mut conn = get_connection();
 
@@ -161,9 +158,11 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
 
               let args = event.as_redis_args();
 
-              pipe.xadd(stream_key, &entry.id, &args[..]).ignore();
               pipe
-                .hset(hash_key, &entry.id, format!("{:?}", &err))
+                .xadd(stream_key.as_ref(), &entry.id, &args[..])
+                .ignore();
+              pipe
+                .hset(hash_key.as_ref(), &entry.id, format!("{:?}", &err))
                 .ignore();
 
               let _: () = pipe.query_async(&mut conn).await?;
@@ -171,11 +170,13 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
             (Some(key), None) => {
               let mut conn = get_connection();
               let args = event.as_redis_args();
-              let _: String = conn.xadd(key, &entry.id, &args[..]).await?;
+              let _: String = conn.xadd(key.as_ref(), &entry.id, &args[..]).await?;
             }
             (None, Some(key)) => {
               let mut conn = get_connection();
-              let _: i64 = conn.hset(key, &entry.id, format!("{:?}", &err)).await?;
+              let _: i64 = conn
+                .hset(key.as_ref(), &entry.id, format!("{:?}", &err))
+                .await?;
             }
             _ => (),
           };
@@ -184,6 +185,68 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
     }
 
     Ok(())
+  }
+}
+
+pub struct Context<'a, T>
+where
+  T: Send + Sync,
+{
+  data: T,
+  consumer_id: String,
+  stream_key: Cow<'a, str>,
+  error_stream_key: Option<Cow<'a, str>>,
+  error_hash_key: Option<Cow<'a, str>>,
+  cancel_token: CancellationToken,
+}
+
+impl<'a, T> Context<'a, T>
+where
+  T: Send + Sync,
+{
+  fn new(
+    data: T,
+    stream_key: Cow<'a, str>,
+    error_stream_key: Option<Cow<'a, str>>,
+    error_hash_key: Option<Cow<'a, str>>,
+  ) -> Self {
+    Self {
+      data,
+      consumer_id: Self::generate_id(),
+      stream_key,
+      error_stream_key,
+      error_hash_key,
+      cancel_token: CancellationToken::new(),
+    }
+  }
+
+  pub fn data(&self) -> &T {
+    &self.data
+  }
+
+  fn generate_id() -> String {
+    thread_rng()
+      .sample_iter(&Alphanumeric)
+      .take(30)
+      .map(char::from)
+      .collect()
+  }
+
+  pub fn consumer_id(&self) -> &str {
+    &self.consumer_id
+  }
+  pub fn stream_key(&self) -> &str {
+    &self.stream_key
+  }
+  pub fn error_stream_key(&self) -> Option<&Cow<'a, str>> {
+    self.error_stream_key.as_ref()
+  }
+  pub fn error_hash_key(&self) -> Option<&Cow<'a, str>> {
+    self.error_hash_key.as_ref()
+  }
+  /// Process claimed stream entries and shutdown
+  pub fn shutdown_gracefully(&self) {
+    self.cancel_token.cancel();
   }
 }
 
@@ -196,7 +259,7 @@ pub enum ConsumerGroupState {
 }
 
 /// Redis event stream reactor
-pub struct EventReactor<T, E, G>
+pub struct EventReactor<'a, T, E, G>
 where
   T: StreamConsumer<E, G>,
   E: StreamEntry,
@@ -204,59 +267,31 @@ where
 {
   group_status: ConsumerGroupState,
   consumer: Arc<T>,
-  consumer_id: String,
+  ctx: Context<'a, T::Data>,
   _marker: PhantomData<fn() -> (E, G)>,
 }
 
-impl<T, E, G> Default for EventReactor<T, E, G>
+impl<'a, T, E, G> EventReactor<'a, T, E, G>
 where
   T: StreamConsumer<E, G>,
   E: StreamEntry,
   G: ConsumerGroup,
 {
-  fn default() -> Self {
-    let consumer = Arc::new(T::default());
-
+  pub fn new(
+    data: T::Data,
+    stream_key: Cow<'a, str>,
+    error_stream_key: Option<Cow<'a, str>>,
+    error_hash_key: Option<Cow<'a, str>>,
+  ) -> Self {
     EventReactor {
       group_status: ConsumerGroupState::Uninitialized,
-      consumer,
-      consumer_id: Self::generate_id(),
+      consumer: Arc::new(T::default()),
+      ctx: Context::new(data, stream_key, error_stream_key, error_hash_key),
       _marker: PhantomData,
     }
   }
-}
 
-impl<T, E, G> Clone for EventReactor<T, E, G>
-where
-  T: StreamConsumer<E, G>,
-  E: StreamEntry,
-  G: ConsumerGroup,
-{
-  fn clone(&self) -> Self {
-    Self {
-      group_status: self.group_status.clone(),
-      consumer: self.consumer.clone(),
-      consumer_id: self.consumer_id.clone(),
-      _marker: PhantomData,
-    }
-  }
-}
-
-impl<T, E, G> EventReactor<T, E, G>
-where
-  T: StreamConsumer<E, G>,
-  E: StreamEntry,
-  G: ConsumerGroup,
-{
-  fn generate_id() -> String {
-    thread_rng()
-      .sample_iter(&Alphanumeric)
-      .take(30)
-      .map(char::from)
-      .collect()
-  }
-
-  /// Manually initialize Redis consumer group; otherwise [`EventReactor::start_reactor`] will initialize
+  /// Manually initialize Redis consumer group; [`EventReactor::start_reactor`] will initialize otherwise
   pub async fn initialize_consumer_group(&mut self) -> Result<ConsumerGroupState, RedisError> {
     let url = RedisEnvService::service_url().map_err(|err| {
       RedisError::from((
@@ -268,19 +303,19 @@ where
     let client = redis::Client::open(url)?;
     let mut conn = client.get_async_connection().await?;
 
-    let result: Result<(), RedisError> = if let Some(error_stream) = T::ERROR_STREAM_KEY {
+    let result: Result<(), RedisError> = if let Some(error_stream) = self.ctx.error_stream_key() {
       let mut pipe = redis::pipe();
       pipe
-        .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
+        .xgroup_create_mkstream(self.ctx.stream_key(), G::GROUP_NAME, "0")
         .ignore();
       pipe
-        .xgroup_create_mkstream(error_stream, G::GROUP_NAME, "0")
+        .xgroup_create_mkstream(error_stream.as_ref(), G::GROUP_NAME, "0")
         .ignore();
 
       pipe.query_async(&mut conn).await
     } else {
       conn
-        .xgroup_create_mkstream(T::STREAM_KEY, G::GROUP_NAME, "0")
+        .xgroup_create_mkstream(self.ctx.stream_key(), G::GROUP_NAME, "0")
         .await
         .map(|_: String| ())
     };
@@ -304,15 +339,19 @@ where
     &self,
     cursor: &str,
   ) -> Result<Option<(String, StreamRangeReply)>, RedisError> {
+    if self.ctx.cancel_token.is_cancelled() {
+      return Ok(None);
+    }
+
     tokio::select! {
       reply = async {
         let mut conn = get_connection();
 
         let mut cmd = redis::cmd("XAUTOCLAIM");
 
-        cmd.arg(T::STREAM_KEY)
+        cmd.arg(self.ctx.stream_key())
           .arg(G::GROUP_NAME)
-          .arg(&self.consumer_id)
+          .arg(&self.ctx.consumer_id())
           .arg(T::MIN_IDLE_TIME.as_millis() as usize)
           .arg(cursor)
           .arg("COUNT")
@@ -322,6 +361,7 @@ where
 
         Ok(Some(reply))
       } => reply,
+      _ = self.ctx.cancel_token.cancelled() => Ok(None),
       _ = signal::ctrl_c() => Ok(None),
     }
   }
@@ -339,7 +379,7 @@ where
       if !reply.ids.is_empty() {
         self
           .consumer
-          .process_event_stream(reply.ids, &DeliveryStatus::MinIdleElapsed)
+          .process_event_stream(&self.ctx, reply.ids, &DeliveryStatus::MinIdleElapsed)
           .await?;
       } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
         if exit_on_idle {
@@ -350,7 +390,12 @@ where
           }
         }
 
-        sleep(sleep_time).await;
+        tokio::select! {
+            _ = self.ctx.cancel_token.cancelled() => {
+              continue;
+            }
+            _ = sleep(sleep_time) => {}
+        }
       }
     }
 
@@ -358,16 +403,20 @@ where
   }
 
   async fn next_batch(&self) -> Result<Option<StreamReadReply>, RedisError> {
+    if self.ctx.cancel_token.is_cancelled() {
+      return Ok(None);
+    }
+
     tokio::select! {
       reply = async {
         let mut conn = get_connection();
 
         let reply: StreamReadReply = conn
         .xread_options(
-          &[T::STREAM_KEY],
+          &[self.ctx.stream_key()],
           &[">"],
           &StreamReadOptions::default()
-            .group(G::GROUP_NAME, &self.consumer_id)
+            .group(G::GROUP_NAME, &self.ctx.consumer_id())
             .block(T::XREAD_BLOCK_TIME.as_millis() as usize)
             .count(T::BATCH_SIZE),
         )
@@ -375,6 +424,7 @@ where
 
         Ok(Some(reply))
       } => reply,
+      _ = self.ctx.cancel_token.cancelled() => Ok(None),
       _ = signal::ctrl_c() => Ok(None)
     }
   }
@@ -393,7 +443,7 @@ where
 
         self
           .consumer
-          .process_event_stream(ids, &DeliveryStatus::NewDelivery)
+          .process_event_stream(&self.ctx, ids, &DeliveryStatus::NewDelivery)
           .await?;
       }
     }
@@ -401,7 +451,7 @@ where
     Ok(())
   }
 
-  /// Indefinitely process redis stream entries, optionally clearing all the potential idle-pending backlog before claiming new entries
+  /// Process redis stream entries until shutdown signal received, optionally clearing all the potential idle-pending backlog before claiming new entries
   pub async fn start_reactor(mut self, clear_backlog: bool) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
