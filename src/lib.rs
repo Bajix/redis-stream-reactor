@@ -1,19 +1,20 @@
 use backoff::ExponentialBackoff;
 use env_url::ServiceURL;
 use futures::{stream, StreamExt, TryStreamExt};
-use itertools::Itertools;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
   streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
-  AsyncCommands, ErrorKind, RedisError, ToRedisArgs, Value,
+  AsyncCommands, ErrorKind, RedisError,
 };
 use redis_swapplex::{get_connection, RedisEnvService};
-use serde::de::Deserialize;
+use serde::{de::Deserialize, ser::Serialize};
 use std::{
   borrow::Cow,
-  collections::HashMap,
+  collections::BTreeMap,
   fmt::Debug,
   marker::PhantomData,
+  num::{ParseFloatError, ParseIntError},
+  str::Utf8Error,
   sync::Arc,
   time::{Duration, SystemTime},
 };
@@ -28,6 +29,46 @@ pub enum DeliveryStatus {
 }
 
 #[derive(Debug, Error)]
+pub enum ParseError {
+  #[error(transparent)]
+  Utf8(#[from] Utf8Error),
+  #[error(transparent)]
+  ParseFloat(#[from] ParseFloatError),
+  #[error(transparent)]
+  ParseInt(#[from] ParseIntError),
+  #[error(transparent)]
+  Serde(#[from] serde_json::Error),
+  #[error(transparent)]
+  Redis(#[from] RedisError),
+}
+
+impl From<ParseError> for RedisError {
+  fn from(err: ParseError) -> Self {
+    match err {
+      ParseError::Utf8(err) => RedisError::from((
+        redis::ErrorKind::TypeError,
+        "Invalid utf8 value",
+        err.to_string(),
+      )),
+      ParseError::ParseFloat(err) => RedisError::from((
+        redis::ErrorKind::TypeError,
+        "Invalid float value",
+        err.to_string(),
+      )),
+      ParseError::ParseInt(err) => RedisError::from((
+        redis::ErrorKind::TypeError,
+        "Invalid integer value",
+        err.to_string(),
+      )),
+      ParseError::Serde(err) => {
+        RedisError::from((ErrorKind::TypeError, "Invalid JSON value", err.to_string()))
+      }
+      ParseError::Redis(err) => err,
+    }
+  }
+}
+
+#[derive(Debug, Error)]
 pub enum TaskError<T: Send + Debug> {
   /// Bypass error handling and delete stream entry via XDEL
   #[error("Stream entry marked for deletion")]
@@ -39,56 +80,67 @@ pub enum TaskError<T: Send + Debug> {
   #[error(transparent)]
   Error(#[from] T),
 }
-
-/// To use generic impl derive [`redis::toRedisArgs`](https://docs.rs/redis/0.21/redis/trait.ToRedisArgs.html) with [`derive_redis_json::RedisJsonValue`](https://docs.rs/derive-redis-json/0.1.1/derive_redis_json/derive.RedisJsonValue.html)
-pub trait StreamEntry: Send + Sync + Sized {
-  fn from_hashmap(data: &HashMap<String, Value>) -> Result<Self, RedisError>;
-  fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
-}
-
-impl<T> StreamEntry for T
-where
-  T: Send + Sync + Sized + for<'de> Deserialize<'de> + ToRedisArgs,
-{
-  fn from_hashmap(entry: &HashMap<String, Value>) -> Result<Self, RedisError> {
-    let data = entry
+pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
+  /// Deserializes from a stringified key value map but only if every field is FromStr. See [`serde_with::PickFirst<(_, serde_with::DisplayFromStr)>`](https://docs.rs/serde_with/1.11.0/serde_with/guide/serde_as_transformations/index.html#pick-first-successful-deserialization)
+  fn from_stream_id(stream_id: &StreamId) -> Result<Self, ParseError> {
+    let data = stream_id
+      .map
       .iter()
-      .map(|(key, value)| match *value {
+      .map(|(key, value)| match value {
         redis::Value::Data(ref bytes) => std::str::from_utf8(&bytes[..])
-          .map_err(|err| {
-            RedisError::from((
-              redis::ErrorKind::TypeError,
-              "Stream field value invalid utf8",
-              err.to_string(),
-            ))
-          })
-          .map(|value| (key.to_owned(), serde_json::Value::String(value.to_owned()))),
-        _ => Err(RedisError::from((
-          redis::ErrorKind::TypeError,
-          "invalid response type for JSON",
-        ))),
+          .map(|value| serde_json::Value::String(String::from(value)))
+          .map_err(|err| err.into())
+          .map(|value| (key.to_owned(), value)),
+        _ => Err(
+          RedisError::from((
+            redis::ErrorKind::TypeError,
+            "invalid response type for JSON",
+          ))
+          .into(),
+        ),
       })
-      .collect::<Result<Vec<(String, serde_json::Value)>, RedisError>>()?;
+      .collect::<Result<Vec<(String, serde_json::Value)>, ParseError>>()?;
 
     let data = serde_json::map::Map::from_iter(data.into_iter());
 
-    serde_json::from_value(serde_json::Value::Object(data)).map_err(|err| {
-      RedisError::from((
-        ErrorKind::TypeError,
-        "JSON deserialization failed",
-        err.to_string(),
-      ))
-    })
+    let data = serde_json::from_value(serde_json::Value::Object(data))?;
+
+    Ok(data)
   }
 
-  fn as_redis_args(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-    self
-      .to_redis_args()
+  /// Serialize into a stringified field value mapping for XADD
+  fn into_xadd_map(&self) -> Result<BTreeMap<String, String>, ParseError> {
+    let value = serde_json::to_value(&self)?;
+
+    let data: Vec<(String, String)> = value
+      .as_object()
       .into_iter()
-      .tuple_windows::<(_, _)>()
-      .collect_vec()
+      .flat_map(|map| {
+        map.into_iter().filter_map(|(key, value)| match value {
+          serde_json::Value::Null => None,
+          serde_json::Value::Bool(value) => Some(Ok((key.to_owned(), value.to_string()))),
+          serde_json::Value::Number(value) => Some(Ok((key.to_owned(), value.to_string()))),
+          serde_json::Value::String(value) => Some(Ok((key.to_owned(), value.to_owned()))),
+
+          serde_json::Value::Array(value) => {
+            Some(serde_json::to_string(value).map(|value| (key.to_owned(), value)))
+          }
+
+          serde_json::Value::Object(value) => {
+            Some(serde_json::to_string(value).map(|value| (key.to_owned(), value)))
+          }
+        })
+      })
+      .collect::<Result<Vec<(String, String)>, serde_json::Error>>()?;
+
+    let data: BTreeMap<String, String> = BTreeMap::from_iter(data.into_iter());
+
+    Ok(data)
   }
 }
+
+impl<T> StreamEntry for T where T: Send + Sync + Serialize + for<'de> Deserialize<'de> {}
+
 pub trait ConsumerGroup {
   const GROUP_NAME: &'static str;
 }
@@ -131,7 +183,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
     entry: StreamId,
     status: &DeliveryStatus,
   ) -> Result<(), RedisError> {
-    let event = <T as StreamEntry>::from_hashmap(&entry.map)?;
+    let event = <T as StreamEntry>::from_stream_id(&entry)?;
 
     match self.process_event(ctx, &event, status).await {
       Ok(()) => {
@@ -156,10 +208,12 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
 
               let mut pipe = redis::pipe();
 
-              let args = event.as_redis_args();
-
               pipe
-                .xadd(stream_key.as_ref(), &entry.id, &args[..])
+                .xadd_map(
+                  stream_key.as_ref(),
+                  &entry.id,
+                  &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
+                )
                 .ignore();
               pipe
                 .hset(hash_key.as_ref(), &entry.id, format!("{:?}", &err))
@@ -169,8 +223,13 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
             }
             (Some(key), None) => {
               let mut conn = get_connection();
-              let args = event.as_redis_args();
-              let _: String = conn.xadd(key.as_ref(), &entry.id, &args[..]).await?;
+              let _: String = conn
+                .xadd_map(
+                  key.as_ref(),
+                  &entry.id,
+                  &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
+                )
+                .await?;
             }
             (None, Some(key)) => {
               let mut conn = get_connection();
@@ -473,6 +532,200 @@ where
         Ok(())
       })
     )?;
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::{BTreeMap, HashMap};
+
+  use crate::StreamEntry;
+  use decimal::d128;
+  use redis::{streams::StreamId, RedisError};
+  use serde::{Deserialize, Serialize};
+  use serde_aux::prelude::*;
+  use serde_with::serde_as;
+  #[derive(Debug, Serialize, Deserialize, PartialEq)]
+  pub struct Author {
+    name: String,
+    tags: Vec<String>,
+  }
+
+  impl TryFrom<&str> for Author {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+      serde_json::from_str(value)
+    }
+  }
+
+  impl TryFrom<String> for Author {
+    type Error = serde_json::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+      serde_json::from_str(value.as_str())
+    }
+  }
+
+  #[derive(Debug, Serialize, Deserialize, PartialEq)]
+  #[serde(tag = "type", rename_all = "camelCase")]
+  pub enum CreateLorem {
+    Sentences {
+      #[serde(deserialize_with = "deserialize_number_from_string")]
+      count: i64,
+    },
+    Paragraphs {
+      #[serde(deserialize_with = "deserialize_number_from_string")]
+      count: i64,
+      #[serde(deserialize_with = "deserialize_number_from_string")]
+      sentences_per_paragraph: i64,
+    },
+  }
+
+  #[serde_as]
+  #[derive(Debug, Serialize, Deserialize, PartialEq)]
+  #[serde(tag = "op", rename_all = "camelCase")]
+  pub enum Op {
+    CreateLorem(CreateLorem),
+    CreatePost {
+      #[serde(deserialize_with = "deserialize_number_from_string")]
+      id: i64,
+      content: String,
+      #[serde_as(as = "serde_with::PickFirst<(_, serde_with::json::JsonString)>")]
+      author: Author,
+    },
+    SetWinRate {
+      rate: d128,
+    },
+  }
+
+  #[test]
+  fn deserializes_from_stream_id() -> Result<(), RedisError> {
+    let mut map: HashMap<String, redis::Value> = HashMap::new();
+    map.insert(
+      "op".into(),
+      redis::Value::Data("createLorem".as_bytes().to_owned()),
+    );
+    map.insert(
+      "type".into(),
+      redis::Value::Data("sentences".as_bytes().to_owned()),
+    );
+    map.insert(
+      "count".into(),
+      redis::Value::Data("100".as_bytes().to_owned()),
+    );
+
+    let stream_id = StreamId {
+      id: "0-0".into(),
+      map,
+    };
+
+    let value = Op::from_stream_id(&stream_id)?;
+
+    assert_eq!(
+      value,
+      Op::CreateLorem(CreateLorem::Sentences { count: 100 })
+    );
+
+    Ok(())
+  }
+
+  #[test]
+  fn deserializes_nested_structs() -> Result<(), RedisError> {
+    let author = Author {
+      name: String::from("Bajix"),
+      tags: vec!["Rustacean".into()],
+    };
+
+    let mut map: HashMap<String, redis::Value> = HashMap::new();
+    map.insert(
+      "op".into(),
+      redis::Value::Data("createPost".as_bytes().to_owned()),
+    );
+    map.insert("id".into(), redis::Value::Data("1".as_bytes().to_owned()));
+    map.insert(
+      "content".into(),
+      redis::Value::Data("Hello World!".as_bytes().to_owned()),
+    );
+    map.insert(
+      "author".into(),
+      redis::Value::Data(
+        serde_json::to_string(&author)
+          .unwrap()
+          .as_bytes()
+          .to_owned(),
+      ),
+    );
+
+    let stream_id = StreamId {
+      id: "0-0".into(),
+      map,
+    };
+
+    let value = Op::from_stream_id(&stream_id)?;
+
+    assert_eq!(
+      value,
+      Op::CreatePost {
+        id: 1,
+        content: String::from("Hello World!"),
+        author
+      }
+    );
+
+    Ok(())
+  }
+
+  #[test]
+  fn deserializes_d128() -> Result<(), RedisError> {
+    let mut map: HashMap<String, redis::Value> = HashMap::new();
+    map.insert(
+      "op".into(),
+      redis::Value::Data("setWinRate".as_bytes().to_owned()),
+    );
+    map.insert(
+      "rate".into(),
+      redis::Value::Data(".5".as_bytes().to_owned()),
+    );
+
+    let stream_id = StreamId {
+      id: "0-0".into(),
+      map,
+    };
+
+    let value = Op::from_stream_id(&stream_id)?;
+
+    assert_eq!(value, Op::SetWinRate { rate: d128!(0.5) });
+
+    Ok(())
+  }
+
+  #[test]
+  fn into_redis_btreemap() -> Result<(), RedisError> {
+    let op = Op::CreatePost {
+      id: 1,
+      content: String::from("Hello World!"),
+      author: Author {
+        name: String::from("Bajix"),
+        tags: vec!["Rustacean".into()],
+      },
+    };
+
+    let data: Vec<(String, String)> = vec![
+      (
+        "author".into(),
+        "{\"name\":\"Bajix\",\"tags\":[\"Rustacean\"]}".into(),
+      ),
+      ("content".into(), "Hello World!".into()),
+      ("id".into(), "1".into()),
+      ("op".into(), "createPost".into()),
+    ];
+
+    let data: BTreeMap<String, String> = BTreeMap::from_iter(data.into_iter());
+
+    assert_eq!(op.into_xadd_map()?, data);
 
     Ok(())
   }
