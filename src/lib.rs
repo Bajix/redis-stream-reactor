@@ -386,7 +386,7 @@ where
     }
   }
 
-  async fn process_idle_pending(&self, exit_on_idle: bool) -> Result<(), RedisError> {
+  async fn process_idle_pending(&self, max_idle: Option<Duration>) -> Result<(), RedisError> {
     let mut cursor = String::from("0-0");
 
     let start_time = SystemTime::now();
@@ -402,9 +402,9 @@ where
           .process_event_stream(&self.ctx, reply.ids, &DeliveryStatus::MinIdleElapsed)
           .await?;
       } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
-        if exit_on_idle {
+        if let Some(max_idle) = max_idle {
           if let Ok(call_elapsed) = poll_time.duration_since(start_time) {
-            if call_elapsed.gt(&T::MIN_IDLE_TIME) {
+            if call_elapsed.gt(&max_idle) {
               continue;
             }
           }
@@ -471,28 +471,46 @@ where
     Ok(())
   }
 
-  /// Process redis stream entries until shutdown signal received, optionally clearing all the potential idle-pending backlog before claiming new entries
-  pub async fn start_reactor(&mut self, clear_backlog: bool) -> Result<(), RedisError> {
+  /// Clearing idle-pending backlog if consumer group was previously created. Initializes consumer group if unitialized.
+  pub async fn clear_backlog(&mut self, max_idle: Duration) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
     }
 
-    if clear_backlog && matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
-      self.process_idle_pending(true).await?;
+    if matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
+      self.process_idle_pending(Some(max_idle)).await?;
     }
 
-    try_join!(
-      backoff::future::retry(ExponentialBackoff::default(), || async {
-        self.process_idle_pending(false).await?;
+    Ok(())
+  }
 
-        Ok(())
-      }),
+  /// Process redis stream entries until shutdown signal received. Initializes consumer group if unitialized.
+  pub async fn start_reactor(&mut self, autoclaim: bool) -> Result<(), RedisError> {
+    if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
+      self.initialize_consumer_group().await?;
+    }
+
+    if autoclaim {
+      try_join!(
+        backoff::future::retry(ExponentialBackoff::default(), || async {
+          self.process_idle_pending(None).await?;
+
+          Ok(())
+        }),
+        backoff::future::retry(ExponentialBackoff::default(), || async {
+          self.process_stream().await?;
+
+          Ok(())
+        })
+      )?;
+    } else {
       backoff::future::retry(ExponentialBackoff::default(), || async {
         self.process_stream().await?;
 
         Ok(())
       })
-    )?;
+      .await?;
+    }
 
     Ok(())
   }
