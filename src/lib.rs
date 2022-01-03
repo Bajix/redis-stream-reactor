@@ -256,7 +256,7 @@ where
   stream_key: Cow<'a, str>,
   error_stream_key: Option<Cow<'a, str>>,
   error_hash_key: Option<Cow<'a, str>>,
-  cancel_token: CancellationToken,
+  cancel_token: Arc<CancellationToken>,
 }
 
 impl<'a, T> Context<'a, T>
@@ -275,7 +275,7 @@ where
       stream_key,
       error_stream_key,
       error_hash_key,
-      cancel_token: CancellationToken::new(),
+      cancel_token: Arc::new(CancellationToken::new()),
     }
   }
 
@@ -511,7 +511,7 @@ where
   }
 
   /// Process redis stream entries until shutdown signal received, optionally clearing all the potential idle-pending backlog before claiming new entries
-  pub async fn start_reactor(mut self, clear_backlog: bool) -> Result<(), RedisError> {
+  pub async fn start_reactor(&mut self, clear_backlog: bool) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
     }
@@ -534,6 +534,10 @@ where
     )?;
 
     Ok(())
+  }
+
+  pub fn shutdown_token(&self) -> Arc<CancellationToken> {
+    self.ctx.cancel_token.clone()
   }
 }
 
