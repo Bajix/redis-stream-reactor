@@ -201,43 +201,15 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
         TaskError::SkipAcknowledgement => (),
         TaskError::Error(err) => {
           log::error!("Error processing stream event: {:?}", err);
-
-          match (ctx.error_stream_key(), ctx.error_hash_key()) {
-            (Some(stream_key), Some(hash_key)) => {
-              let mut conn = get_connection();
-
-              let mut pipe = redis::pipe();
-
-              pipe
-                .xadd_map(
-                  stream_key.as_ref(),
-                  &entry.id,
-                  &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
-                )
-                .ignore();
-              pipe
-                .hset(hash_key.as_ref(), &entry.id, format!("{:?}", &err))
-                .ignore();
-
-              let _: () = pipe.query_async(&mut conn).await?;
-            }
-            (Some(key), None) => {
-              let mut conn = get_connection();
-              let _: String = conn
-                .xadd_map(
-                  key.as_ref(),
-                  &entry.id,
-                  &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
-                )
-                .await?;
-            }
-            (None, Some(key)) => {
-              let mut conn = get_connection();
-              let _: i64 = conn
-                .hset(key.as_ref(), &entry.id, format!("{:?}", &err))
-                .await?;
-            }
-            _ => (),
+          if let Some(stream_key) = &ctx.error_stream_key {
+            let mut conn = get_connection();
+            let _: String = conn
+              .xadd_map(
+                stream_key.as_ref(),
+                &entry.id,
+                &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
+              )
+              .await?;
           };
         }
       },
@@ -255,7 +227,6 @@ where
   consumer_id: String,
   stream_key: Cow<'a, str>,
   error_stream_key: Option<Cow<'a, str>>,
-  error_hash_key: Option<Cow<'a, str>>,
   cancel_token: Arc<CancellationToken>,
 }
 
@@ -263,18 +234,12 @@ impl<'a, T> Context<'a, T>
 where
   T: Send + Sync,
 {
-  fn new(
-    data: T,
-    stream_key: Cow<'a, str>,
-    error_stream_key: Option<Cow<'a, str>>,
-    error_hash_key: Option<Cow<'a, str>>,
-  ) -> Self {
+  fn new(data: T, stream_key: Cow<'a, str>, error_stream_key: Option<Cow<'a, str>>) -> Self {
     Self {
       data,
       consumer_id: Self::generate_id(),
       stream_key,
       error_stream_key,
-      error_hash_key,
       cancel_token: Arc::new(CancellationToken::new()),
     }
   }
@@ -299,9 +264,6 @@ where
   }
   pub fn error_stream_key(&self) -> Option<&Cow<'a, str>> {
     self.error_stream_key.as_ref()
-  }
-  pub fn error_hash_key(&self) -> Option<&Cow<'a, str>> {
-    self.error_hash_key.as_ref()
   }
   /// Process claimed stream entries and shutdown
   pub fn shutdown_gracefully(&self) {
@@ -340,12 +302,11 @@ where
     data: T::Data,
     stream_key: Cow<'a, str>,
     error_stream_key: Option<Cow<'a, str>>,
-    error_hash_key: Option<Cow<'a, str>>,
   ) -> Self {
     EventReactor {
       group_status: ConsumerGroupState::Uninitialized,
       consumer: Arc::new(T::default()),
-      ctx: Context::new(data, stream_key, error_stream_key, error_hash_key),
+      ctx: Context::new(data, stream_key, error_stream_key),
       _marker: PhantomData,
     }
   }
