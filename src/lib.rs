@@ -149,7 +149,7 @@ pub trait ConsumerGroup {
 pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Sync {
   const MIN_IDLE_TIME: Duration = Duration::from_millis(1500);
   const XREAD_BLOCK_TIME: Duration = Duration::from_secs(60);
-  const BATCH_SIZE: usize = 100;
+  const BATCH_SIZE: usize = 20;
   const CONCURRENCY: usize = 10;
   type Error: Send + Debug;
   type Data: Send + Sync;
