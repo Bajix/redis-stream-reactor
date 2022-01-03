@@ -311,7 +311,8 @@ where
     }
   }
 
-  /// Manually initialize Redis consumer group; [`EventReactor::start_reactor`] will initialize otherwise
+  /// Manually initialize Redis consumer group; this will otherwise initialize automatically as needed and
+  /// is useful for knowing if a consumer group was previously created
   pub async fn initialize_consumer_group(&mut self) -> Result<ConsumerGroupState, RedisError> {
     let url = RedisEnvService::service_url().map_err(|err| {
       RedisError::from((
@@ -471,20 +472,22 @@ where
     Ok(())
   }
 
-  /// Clearing idle-pending backlog if consumer group was previously created. Initializes consumer group if unitialized.
-  pub async fn clear_backlog(&mut self, max_idle: Duration) -> Result<(), RedisError> {
+  /// Process idle-pending backlog without claiming new entries until none remain and max_idle has elapsed (relative to start_time)
+  pub async fn clear_idle_backlog(&mut self, max_idle: Option<Duration>) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
     }
 
     if matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
-      self.process_idle_pending(Some(max_idle)).await?;
+      self
+        .process_idle_pending(Some(max_idle.unwrap_or_else(|| Duration::new(0, 0))))
+        .await?;
     }
 
     Ok(())
   }
 
-  /// Process redis stream entries until shutdown signal received. Initializes consumer group if unitialized.
+  /// Process redis stream entries until shutdown signal received
   pub async fn start_reactor(&mut self, autoclaim: bool) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
