@@ -109,7 +109,7 @@ pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
   }
 
   /// Serialize into a stringified field value mapping for XADD
-  fn into_xadd_map(&self) -> Result<BTreeMap<String, String>, ParseError> {
+  fn xadd_map(&self) -> Result<BTreeMap<String, String>, ParseError> {
     let value = serde_json::to_value(&self)?;
 
     let data: Vec<(String, String)> = value
@@ -207,7 +207,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
               .xadd_map(
                 stream_key.as_ref(),
                 &entry.id,
-                &event.into_xadd_map().map_err(|err| RedisError::from(err))?,
+                &event.xadd_map().map_err(|err| RedisError::from(err))?,
               )
               .await?;
           };
@@ -708,7 +708,7 @@ mod tests {
 
     let data: BTreeMap<String, String> = BTreeMap::from_iter(data.into_iter());
 
-    assert_eq!(op.into_xadd_map()?, data);
+    assert_eq!(op.xadd_map()?, data);
 
     Ok(())
   }
