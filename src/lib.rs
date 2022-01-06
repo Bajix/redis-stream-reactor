@@ -147,7 +147,6 @@ pub trait ConsumerGroup {
 
 #[async_trait::async_trait]
 pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Sync {
-  const MIN_IDLE_TIME: Duration = Duration::from_millis(1500);
   const XREAD_BLOCK_TIME: Duration = Duration::from_secs(60);
   const BATCH_SIZE: usize = 20;
   const CONCURRENCY: usize = 10;
@@ -279,6 +278,24 @@ pub enum ConsumerGroupState {
   PreviouslyCreated,
 }
 
+/// [`EventReactor`] claim mode
+pub enum ClaimMode {
+  /// Process new entries while clearing the idle-pending backlog until none remain and max_idle has elapsed
+  ClearBacklog {
+    /// min-idle-time filter for XAUTOCLAIM, which transfers ownership to this consumer of messages pending for more than <min-idle-time>
+    min_idle: Duration,
+    /// max-idle time relative to reactor start time to await newly idle entries before proceeding to only claim new entries
+    max_idle: Option<Duration>,
+  },
+  /// Process new entries while continuously autoclaiming entries from other consumers that have not been acknowledged within the span of min_idle
+  Autoclaim {
+    /// min-idle-time filter for XAUTOCLAIM, which transfers ownership to this consumer of messages pending for more than <min-idle-time>
+    min_idle: Duration,
+  },
+  /// Only process new entries
+  NewOnly,
+}
+
 /// Redis event stream reactor
 pub struct EventReactor<'a, T, E, G>
 where
@@ -358,6 +375,7 @@ where
 
   async fn autoclaim_batch(
     &self,
+    min_idle: &Duration,
     cursor: &str,
   ) -> Result<Option<(String, StreamRangeReply)>, RedisError> {
     if self.ctx.cancel_token.is_cancelled() {
@@ -373,7 +391,7 @@ where
         cmd.arg(self.ctx.stream_key())
           .arg(G::GROUP_NAME)
           .arg(&self.ctx.consumer_id())
-          .arg(T::MIN_IDLE_TIME.as_millis() as usize)
+          .arg(min_idle.as_millis() as usize)
           .arg(cursor)
           .arg("COUNT")
           .arg(T::BATCH_SIZE);
@@ -387,12 +405,16 @@ where
     }
   }
 
-  async fn process_idle_pending(&self, max_idle: Option<Duration>) -> Result<(), RedisError> {
+  async fn process_idle_pending(
+    &self,
+    min_idle: &Duration,
+    max_idle: &Option<Duration>,
+  ) -> Result<(), RedisError> {
     let mut cursor = String::from("0-0");
 
     let start_time = SystemTime::now();
 
-    while let Some((next_cursor, reply)) = self.autoclaim_batch(cursor.as_str()).await? {
+    while let Some((next_cursor, reply)) = self.autoclaim_batch(&min_idle, cursor.as_str()).await? {
       cursor = next_cursor;
 
       let poll_time = SystemTime::now();
@@ -402,7 +424,7 @@ where
           .consumer
           .process_event_stream(&self.ctx, reply.ids, &DeliveryStatus::MinIdleElapsed)
           .await?;
-      } else if let Some(sleep_time) = T::MIN_IDLE_TIME.checked_div(4) {
+      } else if let Some(sleep_time) = min_idle.checked_div(4) {
         if let Some(max_idle) = max_idle {
           if let Ok(call_elapsed) = poll_time.duration_since(start_time) {
             if call_elapsed.gt(&max_idle) {
@@ -473,14 +495,21 @@ where
   }
 
   /// Process idle-pending backlog without claiming new entries until none remain and max_idle has elapsed (relative to start_time)
-  pub async fn clear_idle_backlog(&mut self, max_idle: Option<Duration>) -> Result<(), RedisError> {
+  pub async fn clear_idle_backlog(
+    &mut self,
+    min_idle: &Duration,
+    max_idle: &Option<Duration>,
+  ) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
     }
 
     if matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
       self
-        .process_idle_pending(Some(max_idle.unwrap_or_else(|| Duration::new(0, 0))))
+        .process_idle_pending(
+          &min_idle,
+          &Some(max_idle.unwrap_or_else(|| Duration::new(0, 0))),
+        )
         .await?;
     }
 
@@ -488,31 +517,62 @@ where
   }
 
   /// Process redis stream entries until shutdown signal received
-  pub async fn start_reactor(&mut self, autoclaim: bool) -> Result<(), RedisError> {
+  pub async fn start_reactor(&mut self, claim_mode: ClaimMode) -> Result<(), RedisError> {
     if matches!(self.group_status, ConsumerGroupState::Uninitialized) {
       self.initialize_consumer_group().await?;
     }
 
-    if autoclaim {
-      try_join!(
-        backoff::future::retry(ExponentialBackoff::default(), || async {
-          self.process_idle_pending(None).await?;
+    match claim_mode {
+      ClaimMode::ClearBacklog { min_idle, max_idle } => {
+        if matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
+          try_join!(
+            backoff::future::retry(ExponentialBackoff::default(), || async {
+              self
+                .process_idle_pending(
+                  &min_idle,
+                  &Some(max_idle.unwrap_or_else(|| Duration::new(0, 0))),
+                )
+                .await?;
 
-          Ok(())
-        }),
+              Ok(())
+            }),
+            backoff::future::retry(ExponentialBackoff::default(), || async {
+              self.process_stream().await?;
+
+              Ok(())
+            })
+          )?;
+        } else {
+          backoff::future::retry(ExponentialBackoff::default(), || async {
+            self.process_stream().await?;
+
+            Ok(())
+          })
+          .await?;
+        }
+      }
+      ClaimMode::Autoclaim { min_idle } => {
+        try_join!(
+          backoff::future::retry(ExponentialBackoff::default(), || async {
+            self.process_idle_pending(&min_idle, &None).await?;
+
+            Ok(())
+          }),
+          backoff::future::retry(ExponentialBackoff::default(), || async {
+            self.process_stream().await?;
+
+            Ok(())
+          })
+        )?;
+      }
+      ClaimMode::NewOnly => {
         backoff::future::retry(ExponentialBackoff::default(), || async {
           self.process_stream().await?;
 
           Ok(())
         })
-      )?;
-    } else {
-      backoff::future::retry(ExponentialBackoff::default(), || async {
-        self.process_stream().await?;
-
-        Ok(())
-      })
-      .await?;
+        .await?;
+      }
     }
 
     Ok(())
