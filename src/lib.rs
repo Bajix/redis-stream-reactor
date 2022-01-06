@@ -21,6 +21,8 @@ use std::{
 use thiserror::Error;
 use tokio::{signal, time::sleep, try_join};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum DeliveryStatus {
   /// Stream entry newly delivered to consumer group
   NewDelivery,
@@ -418,7 +420,7 @@ where
 
     let start_time = SystemTime::now();
 
-    while let Some((next_cursor, reply)) = self.autoclaim_batch(&min_idle, cursor.as_str()).await? {
+    while let Some((next_cursor, reply)) = self.autoclaim_batch(min_idle, cursor.as_str()).await? {
       cursor = next_cursor;
 
       let poll_time = SystemTime::now();
@@ -431,7 +433,7 @@ where
       } else if let Some(sleep_time) = min_idle.checked_div(4) {
         if let Some(max_idle) = max_idle {
           if let Ok(call_elapsed) = poll_time.duration_since(start_time) {
-            if call_elapsed.gt(&max_idle) {
+            if call_elapsed.gt(max_idle) {
               continue;
             }
           }
@@ -511,7 +513,7 @@ where
     if matches!(self.group_status, ConsumerGroupState::PreviouslyCreated) {
       self
         .process_idle_pending(
-          &min_idle,
+          min_idle,
           &Some(max_idle.unwrap_or_else(|| Duration::new(0, 0))),
         )
         .await?;
