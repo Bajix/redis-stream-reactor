@@ -199,8 +199,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
           let _: i64 = conn.xdel(ctx.stream_key(), &[&entry.id]).await?;
         }
         TaskError::SkipAcknowledgement => (),
-        TaskError::Error(err) => {
-          log::error!("Error processing stream event: {:?}", err);
+        TaskError::Error(_) => {
           if let Some(stream_key) = &ctx.error_stream_key {
             let mut conn = get_connection();
             let _: String = conn

@@ -14,7 +14,6 @@ async-trait = "0.1.57"
 backoff = { version = "0.4.0", features = ["tokio"] }
 env-url = "2.0.3"
 futures = "0.3"
-log = "0.4"
 rand = "0.8.5"
 redis = { version = "0.21", features = ["aio", "tokio-comp"] }
 redis-swapplex = "0.2.0"
