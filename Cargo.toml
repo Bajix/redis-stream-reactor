@@ -10,21 +10,21 @@ repository = "https://github.com/Bajix/redis-stream-reactor/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1.52"
+async-trait = "0.1.57"
 backoff = { version = "0.4.0", features = ["tokio"] }
-env-url = "1.0.3"
-futures = "0.3.19"
-log = "0.4.14"
-rand = "0.8.4"
+env-url = "2.0.3"
+futures = "0.3"
+log = "0.4"
+rand = "0.8.5"
 redis = { version = "0.21", features = ["aio", "tokio-comp"] }
-redis-swapplex = "0.1.3"
+redis-swapplex = "0.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1.0.30"
+thiserror = "1.0.34"
 tokio = { version = "1", features = ["macros", "signal"] }
-tokio-util = "0.6.9"
+tokio-util = "0.7.4"
 
 [dev-dependencies]
 decimal = "2.1.0"
-serde-aux = "3.0.1"
-serde_with = { version = "1.11.0", features = ["json"] }
+serde-aux = "4.0.0"
+serde_with = { version = "2.0.1", features = ["json"] }

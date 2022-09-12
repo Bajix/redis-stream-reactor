@@ -1,12 +1,11 @@
 use backoff::ExponentialBackoff;
-use env_url::ServiceURL;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
   streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
   AsyncCommands, ErrorKind, RedisError,
 };
-use redis_swapplex::{get_connection, RedisEnvService};
+use redis_swapplex::get_connection;
 use serde::{de::Deserialize, ser::Serialize};
 use std::{
   borrow::Cow,
@@ -337,15 +336,7 @@ where
   /// Manually initialize Redis consumer group; this will otherwise initialize automatically as needed and
   /// is useful for knowing if a consumer group was previously created
   pub async fn initialize_consumer_group(&mut self) -> Result<ConsumerGroupState, RedisError> {
-    let url = RedisEnvService::service_url().map_err(|err| {
-      RedisError::from((
-        ErrorKind::InvalidClientConfig,
-        "Invalid Redis connection URL",
-        err.to_string(),
-      ))
-    })?;
-    let client = redis::Client::open(url)?;
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = get_connection();
 
     let result: Result<(), RedisError> = if let Some(error_stream) = self.ctx.error_stream_key() {
       let mut pipe = redis::pipe();
