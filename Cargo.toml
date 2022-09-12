@@ -1,6 +1,6 @@
 [package]
 name = "redis-stream-reactor"
-version = "0.0.1-beta.30"
+version = "0.0.1-beta.31"
 edition = "2021"
 description = "Redis consumer group reactor"
 readme = "./README.md"

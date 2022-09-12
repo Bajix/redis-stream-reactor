@@ -205,7 +205,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
             let _: String = conn
               .xadd_map(
                 stream_key.as_ref(),
-                &entry.id,
+                "*",
                 &event.xadd_map().map_err(|err| RedisError::from(err))?,
               )
               .await?;
