@@ -70,17 +70,15 @@ impl From<ParseError> for RedisError {
 }
 
 #[derive(Debug, Error)]
-pub enum TaskError<T: Send + Debug> {
+pub enum TaskError {
   /// Bypass error handling and delete stream entry via XDEL
   #[error("Stream entry marked for deletion")]
   Delete,
   /// Skip stream entry acknowledgement
   #[error("Stream entry acknowledgment skipped")]
   SkipAcknowledgement,
-  /// Pass through of original error
-  #[error(transparent)]
-  Error(#[from] T),
 }
+
 pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
   /// Deserializes from a stringified key value map but only if every field is FromStr. See [`serde_with::PickFirst<(_, serde_with::DisplayFromStr)>`](https://docs.rs/serde_with/1.11.0/serde_with/guide/serde_as_transformations/index.html#pick-first-successful-deserialization)
   fn from_stream_id(stream_id: &StreamId) -> Result<Self, ParseError> {
@@ -151,7 +149,6 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
   const XREAD_BLOCK_TIME: Duration = Duration::from_secs(60);
   const BATCH_SIZE: usize = 20;
   const CONCURRENCY: usize = 10;
-  type Error: Send + Debug;
   type Data: Send + Sync;
 
   async fn process_event(
@@ -159,7 +156,7 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
     ctx: &Context<Self::Data>,
     event: &T,
     status: &DeliveryStatus,
-  ) -> Result<(), TaskError<Self::Error>>;
+  ) -> Result<(), TaskError>;
 
   async fn process_event_stream(
     &self,
@@ -199,18 +196,6 @@ pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Syn
           let _: i64 = conn.xdel(ctx.stream_key(), &[&entry.id]).await?;
         }
         TaskError::SkipAcknowledgement => (),
-        TaskError::Error(_) => {
-          if let Some(stream_key) = &ctx.error_stream_key {
-            let mut conn = get_connection();
-            let _: String = conn
-              .xadd_map(
-                stream_key.as_ref(),
-                "*",
-                &event.xadd_map().map_err(|err| RedisError::from(err))?,
-              )
-              .await?;
-          };
-        }
       },
     }
 
@@ -225,7 +210,6 @@ where
   data: T,
   consumer_id: String,
   stream_key: Cow<'a, str>,
-  error_stream_key: Option<Cow<'a, str>>,
   cancel_token: Arc<CancellationToken>,
 }
 
@@ -233,12 +217,11 @@ impl<'a, T> Context<'a, T>
 where
   T: Send + Sync,
 {
-  fn new(data: T, stream_key: Cow<'a, str>, error_stream_key: Option<Cow<'a, str>>) -> Self {
+  fn new(data: T, stream_key: Cow<'a, str>) -> Self {
     Self {
       data,
       consumer_id: Self::generate_id(),
       stream_key,
-      error_stream_key,
       cancel_token: Arc::new(CancellationToken::new()),
     }
   }
@@ -260,9 +243,6 @@ where
   }
   pub fn stream_key(&self) -> &str {
     &self.stream_key
-  }
-  pub fn error_stream_key(&self) -> Option<&Cow<'a, str>> {
-    self.error_stream_key.as_ref()
   }
   /// Process claimed stream entries and shutdown
   pub fn shutdown_gracefully(&self) {
@@ -319,15 +299,11 @@ where
   E: StreamEntry,
   G: ConsumerGroup,
 {
-  pub fn new(
-    data: T::Data,
-    stream_key: Cow<'a, str>,
-    error_stream_key: Option<Cow<'a, str>>,
-  ) -> Self {
+  pub fn new(data: T::Data, stream_key: Cow<'a, str>) -> Self {
     EventReactor {
       group_status: ConsumerGroupState::Uninitialized,
       consumer: Arc::new(T::default()),
-      ctx: Context::new(data, stream_key, error_stream_key),
+      ctx: Context::new(data, stream_key),
       _marker: PhantomData,
     }
   }
@@ -337,22 +313,10 @@ where
   pub async fn initialize_consumer_group(&mut self) -> Result<ConsumerGroupState, RedisError> {
     let mut conn = get_connection();
 
-    let result: Result<(), RedisError> = if let Some(error_stream) = self.ctx.error_stream_key() {
-      let mut pipe = redis::pipe();
-      pipe
-        .xgroup_create_mkstream(self.ctx.stream_key(), G::GROUP_NAME, "0")
-        .ignore();
-      pipe
-        .xgroup_create_mkstream(error_stream.as_ref(), G::GROUP_NAME, "0")
-        .ignore();
-
-      pipe.query_async(&mut conn).await
-    } else {
-      conn
-        .xgroup_create_mkstream(self.ctx.stream_key(), G::GROUP_NAME, "0")
-        .await
-        .map(|_: String| ())
-    };
+    let result: Result<(), RedisError> = conn
+      .xgroup_create_mkstream(self.ctx.stream_key(), G::GROUP_NAME, "0")
+      .await
+      .map(|_: String| ());
 
     match result {
       // It is expected behavior that this will fail when already initalized
