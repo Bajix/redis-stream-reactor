@@ -1,6 +1,6 @@
 [package]
 name = "redis-stream-reactor"
-version = "0.0.1-beta.32"
+version = "0.0.1-beta.33"
 edition = "2021"
 description = "Redis consumer group reactor"
 readme = "./README.md"
@@ -10,20 +10,19 @@ repository = "https://github.com/Bajix/redis-stream-reactor/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1"
 backoff = { version = "0.4", features = ["tokio"] }
-env-url = "2.0.3"
+env-url = "2.0"
 futures = "0.3"
 rand = "0.8.5"
-redis = { version = "0.22", features = ["aio", "tokio-comp"] }
-redis-swapplex = "0.8"
+redis = { version = "0.25", features = ["aio", "tokio-comp"] }
+redis-swapplex = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "signal"] }
-tokio-util = "0.7.7"
+tokio-util = "0.7"
 
 [dev-dependencies]
 decimal = "2.1"
-serde-aux = "4.1.2"
-serde_with = { version = "2.3", features = ["json"] }
+serde-aux = "4.5"
+serde_with = { version = "3.7", features = ["json"] }

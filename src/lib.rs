@@ -1,5 +1,5 @@
 use backoff::ExponentialBackoff;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, Future, StreamExt, TryStreamExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use redis::{
   streams::{StreamId, StreamKey, StreamRangeReply, StreamReadOptions, StreamReadReply},
@@ -100,7 +100,7 @@ pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
       })
       .collect::<Result<Vec<(String, serde_json::Value)>, ParseError>>()?;
 
-    let data = serde_json::map::Map::from_iter(data.into_iter());
+    let data = serde_json::map::Map::from_iter(data);
 
     let data = serde_json::from_value(serde_json::Value::Object(data))?;
 
@@ -109,7 +109,7 @@ pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
 
   /// Serialize into a stringified field value mapping for XADD
   fn xadd_map(&self) -> Result<BTreeMap<String, String>, ParseError> {
-    let value = serde_json::to_value(&self)?;
+    let value = serde_json::to_value(self)?;
 
     let data: Vec<(String, String)> = value
       .as_object()
@@ -132,7 +132,7 @@ pub trait StreamEntry: Send + Sync + Serialize + for<'de> Deserialize<'de> {
       })
       .collect::<Result<Vec<(String, String)>, serde_json::Error>>()?;
 
-    let data: BTreeMap<String, String> = BTreeMap::from_iter(data.into_iter());
+    let data: BTreeMap<String, String> = BTreeMap::from_iter(data);
 
     Ok(data)
   }
@@ -144,62 +144,65 @@ pub trait ConsumerGroup {
   const GROUP_NAME: &'static str;
 }
 
-#[async_trait::async_trait]
 pub trait StreamConsumer<T: StreamEntry, G: ConsumerGroup>: Default + Send + Sync {
   const XREAD_BLOCK_TIME: Duration = Duration::from_secs(60);
   const BATCH_SIZE: usize = 20;
   const CONCURRENCY: usize = 10;
   type Data: Send + Sync;
 
-  async fn process_event(
+  fn process_event(
     &self,
     ctx: &Context<Self::Data>,
     event: &T,
     status: &DeliveryStatus,
-  ) -> Result<(), TaskError>;
+  ) -> impl Future<Output = Result<(), TaskError>> + Send;
 
-  async fn process_event_stream(
+  fn process_event_stream(
     &self,
-    ctx: &Context<Self::Data>,
+    ctx: &Context<'_, Self::Data>,
     ids: Vec<StreamId>,
     status: &DeliveryStatus,
-  ) -> Result<(), RedisError> {
-    stream::iter(ids.into_iter())
-      .map(Ok)
-      .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
-        self.process_stream_entry(ctx, entry, status).await
-      })
-      .await?;
+  ) -> impl Future<Output = Result<(), RedisError>> + Send {
+    async move {
+      stream::iter(ids.into_iter())
+        .map(Ok)
+        .try_for_each_concurrent(Self::CONCURRENCY, |entry| async move {
+          self.process_stream_entry(ctx, entry, status).await
+        })
+        .await?;
 
-    Ok(())
+      Ok(())
+    }
   }
 
-  async fn process_stream_entry(
+  fn process_stream_entry(
     &self,
-    ctx: &Context<Self::Data>,
+    ctx: &Context<'_, Self::Data>,
     entry: StreamId,
     status: &DeliveryStatus,
-  ) -> Result<(), RedisError> {
-    let event = <T as StreamEntry>::from_stream_id(&entry)?;
+  ) -> impl Future<Output = Result<(), RedisError>> + Send {
+    async move {
+      let event = <T as StreamEntry>::from_stream_id(&entry)?;
 
-    match self.process_event(ctx, &event, status).await {
-      Ok(()) => {
-        let mut conn = get_connection();
-
-        let _: i64 = conn
-          .xack(ctx.stream_key(), G::GROUP_NAME, &[&entry.id])
-          .await?;
-      }
-      Err(err) => match err {
-        TaskError::Delete => {
+      match self.process_event(ctx, &event, status).await {
+        Ok(()) => {
           let mut conn = get_connection();
-          let _: i64 = conn.xdel(ctx.stream_key(), &[&entry.id]).await?;
-        }
-        TaskError::SkipAcknowledgement => (),
-      },
-    }
 
-    Ok(())
+          let _: i64 = conn
+            .xack(ctx.stream_key(), G::GROUP_NAME, &[&entry.id])
+            .await?;
+        }
+        Err(err) => match err {
+          TaskError::Delete => {
+            let mut conn = get_connection();
+            let _: i64 = conn.xdel(ctx.stream_key(), &[&entry.id]).await?;
+          }
+          TaskError::SkipAcknowledgement => (),
+        },
+      }
+
+      Ok(())
+    }
   }
 }
 
@@ -350,7 +353,7 @@ where
 
         cmd.arg(self.ctx.stream_key())
           .arg(G::GROUP_NAME)
-          .arg(&self.ctx.consumer_id())
+          .arg(self.ctx.consumer_id())
           .arg(min_idle.as_millis() as usize)
           .arg(cursor)
           .arg("COUNT")
@@ -419,7 +422,7 @@ where
           &[self.ctx.stream_key()],
           &[">"],
           &StreamReadOptions::default()
-            .group(G::GROUP_NAME, &self.ctx.consumer_id())
+            .group(G::GROUP_NAME, self.ctx.consumer_id())
             .block(T::XREAD_BLOCK_TIME.as_millis() as usize)
             .count(T::BATCH_SIZE),
         )
